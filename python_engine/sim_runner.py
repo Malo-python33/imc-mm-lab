@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib.util
 import json
 import math
+import pickle
 import random
 import shutil
 import sys
@@ -12,6 +14,16 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+RANDOM_DRIFT_VOL_FRACTION = 0.05
+RANDOM_VOL_MULT_RANGE = (0.5, 1.75)
+RANDOM_HURST_RANGE = (0.35, 0.75)
+MIN_VOL = 0.01
+MAX_VOL = 20.0
+MIN_HURST = 0.05
+MAX_HURST = 0.95
+MARKET_CACHE_VERSION = 1
 
 
 @dataclass
@@ -107,7 +119,33 @@ def infer_day_from_name(path: Path) -> int:
     return 0
 
 
-def read_prices(paths: list[Path]) -> tuple[list[tuple[int, int]], dict[tuple[int, int, str], BookRow]]:
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def read_trade_ticks(paths: list[Path]) -> set[tuple[int, int]]:
+    ticks: set[tuple[int, int]] = set()
+    for path in paths:
+        file_day = infer_day_from_name(path)
+        with path.open("r", encoding="utf-8", newline="") as file:
+            reader = csv.DictReader(file, delimiter=";")
+            for row in reader:
+                product = str(row.get("symbol") or row.get("product") or "").strip()
+                if not product:
+                    continue
+                quantity = abs(parse_int(row.get("quantity")))
+                if quantity <= 0:
+                    continue
+                day = parse_int(row.get("day"), file_day)
+                timestamp = parse_int(row.get("timestamp"))
+                ticks.add((day, timestamp))
+    return ticks
+
+
+def read_prices(
+    paths: list[Path],
+    tick_filter: set[tuple[int, int]] | None = None,
+) -> tuple[list[tuple[int, int]], dict[tuple[int, int, str], BookRow]]:
     rows_by_key: dict[tuple[int, int, str], BookRow] = {}
     ticks: set[tuple[int, int]] = set()
 
@@ -117,6 +155,8 @@ def read_prices(paths: list[Path]) -> tuple[list[tuple[int, int]], dict[tuple[in
             for row in reader:
                 day = parse_int(row.get("day"), infer_day_from_name(path))
                 timestamp = parse_int(row.get("timestamp"))
+                if tick_filter is not None and (day, timestamp) not in tick_filter:
+                    continue
                 product = str(row.get("product", "")).strip()
                 if not product:
                     continue
@@ -170,6 +210,82 @@ def read_taker_events(paths: list[Path], prices: dict[tuple[int, int, str], Book
                     )
                 )
     return out
+
+
+def file_fingerprint(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def market_cache_path(args: argparse.Namespace) -> Path:
+    payload = {
+        "version": MARKET_CACHE_VERSION,
+        "tick_mode": args.tick_mode,
+        "prices": [file_fingerprint(path) for path in args.price_file],
+        "trades": [file_fingerprint(path) for path in args.trade_file],
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    return args.output_dir.parent / ".cache" / f"market_{digest}.pkl"
+
+
+def load_market_data(args: argparse.Namespace) -> tuple[
+    list[tuple[int, int]],
+    dict[tuple[int, int, str], BookRow],
+    dict[tuple[int, int, str], list[TakerEvent]],
+    dict[str, Any],
+    list[str],
+    set[tuple[int, int]],
+    bool,
+]:
+    cache_path = market_cache_path(args) if args.tick_mode == "trade" else None
+    if cache_path is not None and cache_path.is_file():
+        try:
+            with cache_path.open("rb") as file:
+                cached = pickle.load(file)
+            if cached.get("version") == MARKET_CACHE_VERSION:
+                return (
+                    cached["ticks"],
+                    cached["books"],
+                    cached["takers"],
+                    cached["bot_summary"],
+                    cached["products"],
+                    cached["trade_ticks"],
+                    True,
+                )
+        except Exception:
+            pass
+
+    trade_ticks = read_trade_ticks(args.trade_file)
+    tick_filter = None if args.tick_mode == "all" else trade_ticks
+    ticks, books = read_prices(args.price_file, tick_filter)
+    takers = read_taker_events(args.trade_file, books)
+    bot_summary = summarize_taker_events(takers)
+    products = sorted({product for _day, _timestamp, product in books})
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = cache_path.with_suffix(".tmp")
+        with temp_path.open("wb") as file:
+            pickle.dump(
+                {
+                    "version": MARKET_CACHE_VERSION,
+                    "ticks": ticks,
+                    "books": books,
+                    "takers": takers,
+                    "bot_summary": bot_summary,
+                    "products": products,
+                    "trade_ticks": trade_ticks,
+                },
+                file,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        temp_path.replace(cache_path)
+
+    return ticks, books, takers, bot_summary, products, trade_ticks, False
 
 
 def summarize_taker_events(takers: dict[tuple[int, int, str], list[TakerEvent]]) -> dict[str, Any]:
@@ -288,10 +404,14 @@ def sample_params(args: argparse.Namespace, rng: random.Random) -> tuple[float, 
     randomize_vol = args.randomize_params or args.randomize_vol
     randomize_hurst = args.randomize_params or args.randomize_hurst
 
-    base_vol = max(args.vol, 0.01)
-    drift = rng.uniform(-base_vol * 0.08, base_vol * 0.08) if randomize_drift else args.drift
-    vol = rng.uniform(0.25, 2.5) * base_vol if randomize_vol else args.vol
-    hurst = rng.uniform(0.35, 0.75) if randomize_hurst else args.hurst
+    base_vol = clamp(abs(args.vol), MIN_VOL, MAX_VOL)
+    drift = (
+        rng.uniform(-base_vol * RANDOM_DRIFT_VOL_FRACTION, base_vol * RANDOM_DRIFT_VOL_FRACTION)
+        if randomize_drift
+        else args.drift
+    )
+    vol = rng.uniform(*RANDOM_VOL_MULT_RANGE) * base_vol if randomize_vol else base_vol
+    hurst = rng.uniform(*RANDOM_HURST_RANGE) if randomize_hurst else clamp(args.hurst, MIN_HURST, MAX_HURST)
     return drift, vol, hurst
 
 
@@ -673,6 +793,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--randomize-drift", action="store_true")
     parser.add_argument("--randomize-vol", action="store_true")
     parser.add_argument("--randomize-hurst", action="store_true")
+    parser.add_argument("--tick-mode", choices=["trade", "all"], default="trade")
     parser.add_argument("--output-dir", required=True, type=Path)
     return parser.parse_args()
 
@@ -684,10 +805,7 @@ def main() -> None:
     import datamodel  # type: ignore
 
     trader_cls = load_strategy(args.strategy, args.output_dir)
-    ticks, books = read_prices(args.price_file)
-    takers = read_taker_events(args.trade_file, books)
-    bot_summary = summarize_taker_events(takers)
-    products = sorted({product for _day, _timestamp, product in books})
+    ticks, books, takers, bot_summary, products, trade_ticks, cache_hit = load_market_data(args)
 
     path_results = [
         run_one_path(index, trader_cls, datamodel, products, ticks, books, takers, args)
@@ -709,6 +827,18 @@ def main() -> None:
         "path_asset_limit": path_asset_limit,
         "fills_preview": path_results[0].get("fills_preview", []) if path_results else [],
         "bots": bot_summary,
+        "engine": {
+            "tick_mode": args.tick_mode,
+            "ticks": len(ticks),
+            "trade_ticks": len(trade_ticks),
+            "book_rows": len(books),
+            "products": len(products),
+            "cache_hit": cache_hit,
+            "vol_range": [MIN_VOL, MAX_VOL],
+            "random_vol_multiplier_range": list(RANDOM_VOL_MULT_RANGE),
+            "random_drift_abs_max": RANDOM_DRIFT_VOL_FRACTION,
+            "random_hurst_range": list(RANDOM_HURST_RANGE),
+        },
         "files": files,
     }
     print(json.dumps(response, separators=(",", ":")))

@@ -169,12 +169,16 @@ async function analyzeLog() {
 
 function renderResults(result) {
   const summary = result.summary || {};
+  const engine = result.engine || {};
   const metrics = [
     ["Mean PnL", summary.mean_pnl, summary.mean_pnl],
     ["Robust PnL", summary.mean_robust_pnl, summary.mean_robust_pnl],
     ["Mean Edge", summary.mean_edge, summary.mean_edge],
     ["Mean Carry", summary.mean_carry, summary.mean_carry],
     ["Positive", `${formatNumber((summary.positive_rate || 0) * 100, 1)}%`, summary.positive_rate - 0.5],
+    ["Ticks", engine.ticks === undefined ? "-" : formatNumber(engine.ticks, 0), 0],
+    ["Books", engine.book_rows === undefined ? "-" : formatNumber(engine.book_rows, 0), 0],
+    ["Cache", engine.cache_hit ? "hit" : "build", engine.cache_hit ? 1 : 0],
   ];
   $("metrics").innerHTML = metrics
     .map(([label, value, tone]) => {
